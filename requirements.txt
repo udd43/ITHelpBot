@@ -2,3 +2,5 @@ slack-bolt>=1.18.0
 slack-sdk>=3.27.0
 python-dotenv>=1.0.0
 requests>=2.31.0
+google-api-python-client>=2.154.0
+google-auth>=2.35.0

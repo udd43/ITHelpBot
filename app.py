@@ -11,6 +11,9 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from knowledge_loader import KnowledgeLoader
 from groq_client import GroqClient
+from notion_client import NotionClient
+from google_docs_client import GoogleDocsClient
+from google_search_client import GoogleSearchClient
 
 
 logging.basicConfig(
@@ -46,6 +49,28 @@ def create_app() -> App:
         groq_client = GroqClient()
     except ValueError as e:
         raise RuntimeError(str(e)) from e
+
+    # 선택적 연동: Notion, Google Docs, Google 검색
+    notion_client: Optional[NotionClient]
+    google_docs_client: Optional[GoogleDocsClient]
+    google_search_client: Optional[GoogleSearchClient]
+    try:
+        notion_client = NotionClient()
+    except ValueError:
+        notion_client = None
+        logger.info("Notion 연동 비활성화 (환경변수 미설정)")
+
+    try:
+        google_docs_client = GoogleDocsClient()
+    except Exception:
+        google_docs_client = None
+        logger.info("Google Docs 연동 비활성화 (환경변수 또는 자격 증명 미설정)")
+
+    try:
+        google_search_client = GoogleSearchClient()
+    except ValueError:
+        google_search_client = None
+        logger.info("Google 검색 연동 비활성화 (환경변수 미설정)")
 
     app = App(token=bot_token, signing_secret=signing_secret)
 
@@ -99,7 +124,148 @@ def create_app() -> App:
             )
             return
 
-        say(text=answer, channel=channel, thread_ts=thread_ts)
+        # IT 이슈를 Notion / Google Docs에 기록 (가능한 경우)
+        notion_url: Optional[str] = None
+        docs_url: Optional[str] = None
+        slack_link: Optional[str] = None
+
+        if channel and thread_ts:
+            team_id = body.get("team_id")
+            if team_id:
+                slack_link = f"https://app.slack.com/client/{team_id}/{channel}/thread/{channel}-{thread_ts}"
+
+        title = question[:50]
+        user_name = event.get("user")
+
+        if notion_client is not None:
+            try:
+                notion_url = notion_client.create_issue_page(
+                    title=title,
+                    question=question,
+                    answer=answer,
+                    slack_user=user_name,
+                    slack_link=slack_link,
+                )
+            except Exception as e:  # pragma: no cover - 외부 연동 에러
+                logger.error("Notion 페이지 생성 실패: %s", e)
+
+        if google_docs_client is not None:
+            try:
+                docs_url = google_docs_client.create_issue_doc(
+                    title=title,
+                    question=question,
+                    answer=answer,
+                )
+            except Exception as e:  # pragma: no cover - 외부 연동 에러
+                logger.error("Google Docs 문서 생성 실패: %s", e)
+
+        extra_links = []
+        if notion_url:
+            extra_links.append(f"노션 기록: {notion_url}")
+        if docs_url:
+            extra_links.append(f"Google Docs 기록: {docs_url}")
+
+        final_text = answer
+        if extra_links:
+            final_text += "\n\n" + "\n".join(extra_links)
+
+        # 내부 지식(txt 기반)에서 컨텍스트를 찾지 못했을 때만, 구글 검색 제안 버튼 노출
+        show_google_option = google_search_client is not None and (not context.strip())
+
+        if show_google_option:
+            say(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=final_text,
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": final_text},
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "내부 자료에서는 뚜렷한 해결 방법을 찾지 못했어요.\n*구글 검색 결과도 함께 보시겠어요?*",
+                        },
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {"type": "plain_text", "text": "네, 구글 검색도 보여줘"},
+                                "style": "primary",
+                                "action_id": "google_search_yes",
+                                "value": question[:300],
+                            },
+                            {
+                                "type": "button",
+                                "text": {"type": "plain_text", "text": "아니요, 괜찮아요"},
+                                "action_id": "google_search_no",
+                                "value": question[:300],
+                            },
+                        ],
+                    },
+                ],
+            )
+        else:
+            say(text=final_text, channel=channel, thread_ts=thread_ts)
+
+    @app.action("google_search_yes")
+    def handle_google_search_yes(ack, body, say, logger):  # type: ignore[no-untyped-def]
+        ack()
+        if google_search_client is None:
+            say(text="구글 검색 연동이 설정되어 있지 않습니다. 관리자에게 문의해주세요.")
+            return
+
+        action = (body.get("actions") or [{}])[0]
+        query = action.get("value") or ""
+
+        container = body.get("container", {}) or {}
+        channel_id = container.get("channel_id")
+        thread_ts = container.get("thread_ts") or container.get("message_ts")
+
+        try:
+            results = google_search_client.search(query=query, max_results=3)
+        except Exception as e:  # pragma: no cover - 외부 연동 에러
+            logger.error("Google 검색 실패: %s", e)
+            say(
+                text="구글 검색 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
+                channel=channel_id,
+                thread_ts=thread_ts,
+            )
+            return
+
+        if not results:
+            say(
+                text="구글 검색 결과에서도 특별한 해결 방법을 찾지 못했습니다.",
+                channel=channel_id,
+                thread_ts=thread_ts,
+            )
+            return
+
+        lines = ["구글 검색 상위 결과입니다:"]
+        for idx, (title, link, snippet) in enumerate(results, start=1):
+            lines.append(f"{idx}. <{link}|{title}>\n   {snippet}")
+
+        say(
+            text="\n".join(lines),
+            channel=channel_id,
+            thread_ts=thread_ts,
+        )
+
+    @app.action("google_search_no")
+    def handle_google_search_no(ack, body, say):  # type: ignore[no-untyped-def]
+        ack()
+        container = body.get("container", {}) or {}
+        channel_id = container.get("channel_id")
+        thread_ts = container.get("thread_ts") or container.get("message_ts")
+        say(
+            text="알겠습니다. 이번에는 내부 자료와 Groq 답변만 참고하겠습니다.",
+            channel=channel_id,
+            thread_ts=thread_ts,
+        )
 
     # 필요시 DM, 슬래시 커맨드 등으로 확장 가능
 
