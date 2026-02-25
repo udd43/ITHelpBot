@@ -24,8 +24,8 @@ logger = logging.getLogger(__name__)
 
 
 def load_env() -> None:
-    # 현재 디렉터리의 .env 로드
-    load_dotenv()
+    # 현재 디렉터리의 .env 로드 (환경변수 덮어쓰기 허용)
+    load_dotenv(override=True)
 
 
 def create_app() -> App:
